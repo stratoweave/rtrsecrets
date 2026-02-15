@@ -1,0 +1,4 @@
+name = "rtrsecrets"
+fingerprint = 0x04529d8d2b029f28
+dependencies = {}
+zig_dependencies = {}
