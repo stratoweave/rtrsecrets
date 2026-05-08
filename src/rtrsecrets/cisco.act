@@ -1,9 +1,11 @@
-"""Cisco "Type 9" password hashing.
+"""Cisco router secrets.
 
-Cisco IOS / IOS-XE Type 9 secrets use scrypt with fixed parameters
-(N=16384, r=1, p=1, dkLen=32) and a custom base64 encoding of both the
-14-character salt and the 32-byte derived key.  The resulting hash is
-formatted as "$9$<salt>$<encoded-hash>".
+Type 7: a reversible XOR cipher (sometimes called "Cisco Vigenere"),
+used for `service password-encryption` obfuscation.
+
+Type 9: scrypt with fixed parameters (N=16384, r=1, p=1, dkLen=32) and
+a custom base64 encoding of both the 14-character salt and the 32-byte
+derived key, formatted as "$9$<salt>$<encoded-hash>".
 """
 import testing
 import random
@@ -45,7 +47,7 @@ def _b64_encode(data: bytes) -> str:
 
 
 def _random_salt() -> str:
-    s: str = ""
+    s = ""
     for _ in range(SALT_LEN):
         s += ALPHABET[random.randint(0, len(ALPHABET))]
     return s
@@ -67,7 +69,7 @@ def _check_salt(salt: str) -> None:
 
 def cisco_type9_encrypt_with_salt(plaintext: str, salt: str) -> str:
     _check_salt(salt)
-    derived: bytes = xcrypt.scrypt(
+    derived = xcrypt.scrypt(
         plaintext.encode(),
         salt.encode(),
         SCRYPT_N, SCRYPT_R, SCRYPT_P, DK_LEN,
@@ -130,3 +132,42 @@ def _test_invalid_salt_alphabet():
         testing.assertTrue(False)
     except ValueError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Type 7 (reversible XOR / "Cisco Vigenere")
+# ---------------------------------------------------------------------------
+#
+# Ported from https://github.com/plajjan/java-CiscoVigenere
+
+_TYPE7_KEY = "dsfd;kfoA,.iyewrkldJKDHSUBsgvca69834ncxv9873254k;fg87"
+
+
+def cisco_type7_encrypt(plaintext: str, init: int) -> str:
+    if init < 0 or init > len(_TYPE7_KEY):
+        raise ValueError("Cisco Type 7 seed must be between 0 and 53")
+    key = _TYPE7_KEY[init:len(_TYPE7_KEY)] + _TYPE7_KEY[0:init]
+    res = "%02d" % init
+    for i in range(0, len(plaintext)):
+        res += "%02X" % (ord(plaintext[i]) ^ ord(key[i % len(key)]))
+    return res
+
+
+def cisco_type7_decrypt(ciphertext: str) -> str:
+    init = int(ciphertext[0:2])
+    key = _TYPE7_KEY[init-1:len(_TYPE7_KEY)] + _TYPE7_KEY[0:init-1]
+    res = ""
+    for i in range(1, int(len(ciphertext)/2)):
+        c = ciphertext[2*i:2*i+2]
+        res += chr(int(c, base=16) ^ ord(key[i % len(key)]))
+    return res
+
+
+def _test_cisco_type7_encrypt():
+    e = cisco_type7_encrypt("letmein", 4)
+    testing.assertEqual(e, "04570E1202244540")
+
+
+def _test_cisco_type7_decrypt():
+    d = cisco_type7_decrypt("04570E1202244540")
+    testing.assertEqual(d, "letmein")
