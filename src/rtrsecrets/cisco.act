@@ -1,0 +1,132 @@
+"""Cisco "Type 9" password hashing.
+
+Cisco IOS / IOS-XE Type 9 secrets use scrypt with fixed parameters
+(N=16384, r=1, p=1, dkLen=32) and a custom base64 encoding of both the
+14-character salt and the 32-byte derived key.  The resulting hash is
+formatted as "$9$<salt>$<encoded-hash>".
+"""
+import testing
+import random
+import xcrypt
+
+MAGIC = "$9$"
+
+# Cisco Type 9 base64 alphabet: same as the crypt(3) family (used by SHA-256
+# and SHA-512 crypt) but - unlike those - Cisco packs bits big-endian within
+# each 24-bit group, i.e. RFC 4648 ordering.  So this can't be expressed as
+# either Acton's base64 (RFC 4648 alphabet) or libxcrypt's crypt-base64
+# (./0-9A-Za-z alphabet, little-endian) - we hand-roll it.
+ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+SALT_LEN = 14
+HASH_LEN = 43
+DK_LEN = 32
+SCRYPT_N = 16384
+SCRYPT_R = 1
+SCRYPT_P = 1
+
+
+def _b64_encode(data: bytes) -> str:
+    result = ""
+    i = 0
+    n = len(data)
+    while i < n:
+        b0 = int(data[i])
+        b1 = int(data[i + 1]) if i + 1 < n else 0
+        b2 = int(data[i + 2]) if i + 2 < n else 0
+        result += ALPHABET[(b0 >> 2) & 0x3f]
+        result += ALPHABET[((b0 << 4) | (b1 >> 4)) & 0x3f]
+        if i + 1 < n:
+            result += ALPHABET[((b1 << 2) | (b2 >> 6)) & 0x3f]
+        if i + 2 < n:
+            result += ALPHABET[b2 & 0x3f]
+        i += 3
+    return result
+
+
+def _random_salt() -> str:
+    s: str = ""
+    for _ in range(SALT_LEN):
+        s += ALPHABET[random.randint(0, len(ALPHABET))]
+    return s
+
+
+def _salt_uses_alphabet(salt: str) -> bool:
+    for ch in salt:
+        if ch not in ALPHABET:
+            return False
+    return True
+
+
+def _check_salt(salt: str) -> None:
+    if len(salt) != SALT_LEN:
+        raise ValueError("Cisco Type 9 salt must be exactly 14 chars")
+    if not _salt_uses_alphabet(salt):
+        raise ValueError("Cisco Type 9 salt must use the crypt-base64 alphabet")
+
+
+def cisco_type9_encrypt_with_salt(plaintext: str, salt: str) -> str:
+    _check_salt(salt)
+    derived: bytes = xcrypt.scrypt(
+        plaintext.encode(),
+        salt.encode(),
+        SCRYPT_N, SCRYPT_R, SCRYPT_P, DK_LEN,
+    )
+    return MAGIC + salt + "$" + _b64_encode(derived)
+
+
+def cisco_type9_encrypt(plaintext: str, salt: ?str = None) -> str:
+    actual_salt = salt if salt is not None else _random_salt()
+    return cisco_type9_encrypt_with_salt(plaintext, actual_salt)
+
+
+def cisco_type9_verify(plaintext: str, hash: str) -> bool:
+    if not hash.startswith(MAGIC):
+        return False
+    rest = hash[3:]
+    parts = rest.split("$")
+    if len(parts) != 2:
+        return False
+    salt = parts[0]
+    if len(salt) != SALT_LEN:
+        return False
+    if not _salt_uses_alphabet(salt):
+        return False
+    return cisco_type9_encrypt_with_salt(plaintext, salt) == hash
+
+
+def _test_admin_known_vector():
+    expected = "$9$dDAKHGPHszQR5E$dr79mmOyTuaEOoJ/fY2GOlcrdhY8.3Vb9wLX90UqLo6"
+    got = cisco_type9_encrypt_with_salt("admin", "dDAKHGPHszQR5E")
+    testing.assertEqual(got, expected)
+
+
+def _test_verify_known_vector():
+    h = "$9$dDAKHGPHszQR5E$dr79mmOyTuaEOoJ/fY2GOlcrdhY8.3Vb9wLX90UqLo6"
+    testing.assertTrue(cisco_type9_verify("admin", h))
+    testing.assertFalse(cisco_type9_verify("Admin", h))
+    testing.assertFalse(cisco_type9_verify("", h))
+
+
+def _test_random_salt_roundtrip():
+    h = cisco_type9_encrypt("hunter2")
+    testing.assertTrue(h.startswith(MAGIC))
+    testing.assertEqual(len(h), 3 + SALT_LEN + 1 + HASH_LEN)
+    testing.assertTrue(cisco_type9_verify("hunter2", h))
+    testing.assertFalse(cisco_type9_verify("hunter3", h))
+
+
+def _test_invalid_salt_length():
+    try:
+        _ignored = cisco_type9_encrypt_with_salt("x", "tooshort")
+        testing.assertTrue(False)
+    except ValueError:
+        pass
+
+
+def _test_invalid_salt_alphabet():
+    try:
+        _ignored = cisco_type9_encrypt_with_salt("x", "!" * SALT_LEN)
+        testing.assertTrue(False)
+    except ValueError:
+        pass
