@@ -6,26 +6,34 @@ used for `service password-encryption` obfuscation.
 Type 9: scrypt with fixed parameters (N=16384, r=1, p=1, dkLen=32) and
 a custom base64 encoding of both the 14-character salt and the 32-byte
 derived key, formatted as "$9$<salt>$<encoded-hash>".
+
+Type 14: Cisco's "Convoluted Type 9" - a Type 5 (MD5-crypt) hash that
+has been wrapped in a Type 9 (scrypt) hash, generated when an existing
+Type 5 secret is auto-upgraded by IOS.  Format is
+"$14$<type5_salt>$<type9_salt>$<encoded-hash>"; the password fed into
+scrypt is the full "$1$<type5_salt>$<md5_digest>" Type 5 string.
 """
 import testing
 import random
 import xcrypt
 
-MAGIC = "$9$"
+_MAGIC9 = "$9$"
+_MAGIC14 = "$14$"
 
-# Cisco Type 9 base64 alphabet: same as the crypt(3) family (used by SHA-256
-# and SHA-512 crypt) but - unlike those - Cisco packs bits big-endian within
-# each 24-bit group, i.e. RFC 4648 ordering.  So this can't be expressed as
-# either Acton's base64 (RFC 4648 alphabet) or libxcrypt's crypt-base64
-# (./0-9A-Za-z alphabet, little-endian) - we hand-roll it.
-ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+# Cisco Type 9 / 14 base64 alphabet: same as the crypt(3) family (used by
+# SHA-256 and SHA-512 crypt) but - unlike those - Cisco packs bits big-endian
+# within each 24-bit group, i.e. RFC 4648 ordering.  So this can't be
+# expressed as either Acton's base64 (RFC 4648 alphabet) or libxcrypt's
+# crypt-base64 (./0-9A-Za-z alphabet, little-endian) - we hand-roll it.
+_ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-SALT_LEN = 14
-HASH_LEN = 43
-DK_LEN = 32
-SCRYPT_N = 16384
-SCRYPT_R = 1
-SCRYPT_P = 1
+_SALT_LEN = 14
+_TYPE5_SALT_LEN = 4
+_HASH_LEN = 43
+_DK_LEN = 32
+_SCRYPT_N = 16384
+_SCRYPT_R = 1
+_SCRYPT_P = 1
 
 
 def _b64_encode(data: bytes) -> str:
@@ -36,65 +44,97 @@ def _b64_encode(data: bytes) -> str:
         b0 = int(data[i])
         b1 = int(data[i + 1]) if i + 1 < n else 0
         b2 = int(data[i + 2]) if i + 2 < n else 0
-        result += ALPHABET[(b0 >> 2) & 0x3f]
-        result += ALPHABET[((b0 << 4) | (b1 >> 4)) & 0x3f]
+        result += _ALPHABET[(b0 >> 2) & 0x3f]
+        result += _ALPHABET[((b0 << 4) | (b1 >> 4)) & 0x3f]
         if i + 1 < n:
-            result += ALPHABET[((b1 << 2) | (b2 >> 6)) & 0x3f]
+            result += _ALPHABET[((b1 << 2) | (b2 >> 6)) & 0x3f]
         if i + 2 < n:
-            result += ALPHABET[b2 & 0x3f]
+            result += _ALPHABET[b2 & 0x3f]
         i += 3
     return result
 
 
-def _random_salt() -> str:
+def _random_chars(length: int) -> str:
     s = ""
-    for _ in range(SALT_LEN):
-        s += ALPHABET[random.randint(0, len(ALPHABET))]
+    for _ in range(length):
+        s += _ALPHABET[random.randint(0, len(_ALPHABET))]
     return s
 
 
-def _salt_uses_alphabet(salt: str) -> bool:
-    for ch in salt:
-        if ch not in ALPHABET:
+def _uses_alphabet(s: str) -> bool:
+    for ch in s:
+        if ch not in _ALPHABET:
             return False
     return True
 
 
-def _check_salt(salt: str) -> None:
-    if len(salt) != SALT_LEN:
-        raise ValueError("Cisco Type 9 salt must be exactly 14 chars")
-    if not _salt_uses_alphabet(salt):
-        raise ValueError("Cisco Type 9 salt must use the crypt-base64 alphabet")
+def _check_salt(salt: str, expected_len: int, label: str) -> None:
+    if len(salt) != expected_len:
+        raise ValueError("{label} salt must be exactly {expected_len} chars")
+    if not _uses_alphabet(salt):
+        raise ValueError("{label} salt must use the crypt-base64 alphabet")
 
 
 def cisco_type9_encrypt_with_salt(plaintext: str, salt: str) -> str:
-    _check_salt(salt)
+    _check_salt(salt, _SALT_LEN, "Cisco Type 9")
     derived = xcrypt.scrypt(
         plaintext.encode(),
         salt.encode(),
-        SCRYPT_N, SCRYPT_R, SCRYPT_P, DK_LEN,
+        _SCRYPT_N, _SCRYPT_R, _SCRYPT_P, _DK_LEN,
     )
-    return MAGIC + salt + "$" + _b64_encode(derived)
+    return _MAGIC9 + salt + "$" + _b64_encode(derived)
 
 
 def cisco_type9_encrypt(plaintext: str, salt: ?str = None) -> str:
-    actual_salt = salt if salt is not None else _random_salt()
+    actual_salt = salt if salt is not None else _random_chars(_SALT_LEN)
     return cisco_type9_encrypt_with_salt(plaintext, actual_salt)
 
 
 def cisco_type9_verify(plaintext: str, hash: str) -> bool:
-    if not hash.startswith(MAGIC):
+    if not hash.startswith(_MAGIC9):
         return False
-    rest = hash[3:]
+    rest = hash[len(_MAGIC9):]
     parts = rest.split("$")
     if len(parts) != 2:
         return False
     salt = parts[0]
-    if len(salt) != SALT_LEN:
-        return False
-    if not _salt_uses_alphabet(salt):
+    if len(salt) != _SALT_LEN or not _uses_alphabet(salt):
         return False
     return cisco_type9_encrypt_with_salt(plaintext, salt) == hash
+
+
+def cisco_type14_encrypt_with_salts(plaintext: str, type5_salt: str, type9_salt: str) -> str:
+    _check_salt(type5_salt, _TYPE5_SALT_LEN, "Cisco Type 5")
+    _check_salt(type9_salt, _SALT_LEN, "Cisco Type 9")
+    md5_crypt = xcrypt.crypt_md5(plaintext, type5_salt)
+    derived = xcrypt.scrypt(
+        md5_crypt.encode(),
+        type9_salt.encode(),
+        _SCRYPT_N, _SCRYPT_R, _SCRYPT_P, _DK_LEN,
+    )
+    return _MAGIC14 + type5_salt + "$" + type9_salt + "$" + _b64_encode(derived)
+
+
+def cisco_type14_encrypt(plaintext: str, type5_salt: ?str = None, type9_salt: ?str = None) -> str:
+    t5 = type5_salt if type5_salt is not None else _random_chars(_TYPE5_SALT_LEN)
+    t9 = type9_salt if type9_salt is not None else _random_chars(_SALT_LEN)
+    return cisco_type14_encrypt_with_salts(plaintext, t5, t9)
+
+
+def cisco_type14_verify(plaintext: str, hash: str) -> bool:
+    if not hash.startswith(_MAGIC14):
+        return False
+    rest = hash[len(_MAGIC14):]
+    parts = rest.split("$")
+    if len(parts) != 3:
+        return False
+    type5_salt = parts[0]
+    type9_salt = parts[1]
+    if len(type5_salt) != _TYPE5_SALT_LEN or not _uses_alphabet(type5_salt):
+        return False
+    if len(type9_salt) != _SALT_LEN or not _uses_alphabet(type9_salt):
+        return False
+    return cisco_type14_encrypt_with_salts(plaintext, type5_salt, type9_salt) == hash
 
 
 def _test_admin_known_vector():
@@ -112,8 +152,8 @@ def _test_verify_known_vector():
 
 def _test_random_salt_roundtrip():
     h = cisco_type9_encrypt("hunter2")
-    testing.assertTrue(h.startswith(MAGIC))
-    testing.assertEqual(len(h), 3 + SALT_LEN + 1 + HASH_LEN)
+    testing.assertTrue(h.startswith(_MAGIC9))
+    testing.assertEqual(len(h), len(_MAGIC9) + _SALT_LEN + 1 + _HASH_LEN)
     testing.assertTrue(cisco_type9_verify("hunter2", h))
     testing.assertFalse(cisco_type9_verify("hunter3", h))
 
@@ -128,10 +168,30 @@ def _test_invalid_salt_length():
 
 def _test_invalid_salt_alphabet():
     try:
-        _ignored = cisco_type9_encrypt_with_salt("x", "!" * SALT_LEN)
+        _ignored = cisco_type9_encrypt_with_salt("x", "!" * _SALT_LEN)
         testing.assertTrue(False)
     except ValueError:
         pass
+
+
+def _test_type14_known_vector():
+    expected = "$14$cRsS$32/32gmHWtaq1E$oahEIolcfW7E/iEEHWAd09bHG34FfsxlIPZ68nh93S2"
+    got = cisco_type14_encrypt_with_salts("admin", "cRsS", "32/32gmHWtaq1E")
+    testing.assertEqual(got, expected)
+
+
+def _test_type14_verify_known_vector():
+    h = "$14$cRsS$32/32gmHWtaq1E$oahEIolcfW7E/iEEHWAd09bHG34FfsxlIPZ68nh93S2"
+    testing.assertTrue(cisco_type14_verify("admin", h))
+    testing.assertFalse(cisco_type14_verify("Admin", h))
+    testing.assertFalse(cisco_type14_verify("", h))
+
+
+def _test_type14_random_roundtrip():
+    h = cisco_type14_encrypt("hunter2")
+    testing.assertTrue(h.startswith(_MAGIC14))
+    testing.assertTrue(cisco_type14_verify("hunter2", h))
+    testing.assertFalse(cisco_type14_verify("hunter3", h))
 
 
 # ---------------------------------------------------------------------------
