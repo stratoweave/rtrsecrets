@@ -1,39 +1,49 @@
-"""Junos secrets encryption and decryption
+"""Junos router secrets.
+
+Type 9: a reversible Vigenere-like cipher used for `$9$` secrets in
+Junos configurations.  Despite sharing the "$9$" magic with Cisco
+Type 9, this is a completely different algorithm: a custom family-
+based alphabet with positional encoding, fully reversible.
 
 Inspired by https://metacpan.org/pod/Crypt::Juniper
 """
 import testing
+import random
 
-MAGIC = "$9$"
+_MAGIC = "$9$"
 
-FAMILY = ["QzF3n6/9CAtpu0O", "B1IREhcSyrleKvMW8LXx", "7N-dVbwsY2g4oaJZGUDj", "iHkq.mPf5T"]
+_FAMILY = ["QzF3n6/9CAtpu0O", "B1IREhcSyrleKvMW8LXx", "7N-dVbwsY2g4oaJZGUDj", "iHkq.mPf5T"]
 
-ENCODING = [[1, 4, 32], [1, 16, 32], [1, 8, 32], [1, 64], [1, 32], [1, 4, 16, 128], [1, 32, 64]]
+_ENCODING = [[1, 4, 32], [1, 16, 32], [1, 8, 32], [1, 64], [1, 32], [1, 4, 16, 128], [1, 32, 64]]
 
-def get_extra() -> dict[str, int]:
+
+def _get_extra() -> dict[str, int]:
     extra: dict[str, int] = {}
     idx: int = 0
-    for fam in FAMILY:
+    for fam in _FAMILY:
         for char in fam:
             extra[char] = 3 - idx
         idx += 1
     return extra
 
-def get_num_alpha() -> list[str]:
+
+def _get_num_alpha() -> list[str]:
     num_alpha: list[str] = []
-    for fam in FAMILY:
+    for fam in _FAMILY:
         for char in fam:
             num_alpha.append(char)
     return num_alpha
 
-def get_alpha_num() -> dict[str, int]:
-    num_alpha = get_num_alpha()
+
+def _get_alpha_num() -> dict[str, int]:
+    num_alpha = _get_num_alpha()
     alpha_num: dict[str, int] = {}
     idx: int = 0
     for char in num_alpha:
         alpha_num[char] = idx
         idx += 1
     return alpha_num
+
 
 def _nibble(cref: str, length: int) -> (str, str):
     nib: str = cref[:length]
@@ -42,9 +52,10 @@ def _nibble(cref: str, length: int) -> (str, str):
         raise ValueError("Ran out of characters: hit '{nib}', expecting {length} chars")
     return (nib, rest)
 
+
 def _gap(c1: str, c2: str) -> int:
-    alpha_num = get_alpha_num()
-    num_alpha = get_num_alpha()
+    alpha_num = _get_alpha_num()
+    num_alpha = _get_num_alpha()
     v1: int = alpha_num[c2]
     v2: int = alpha_num[c1]
     mod_val: int = len(num_alpha)
@@ -55,6 +66,7 @@ def _gap(c1: str, c2: str) -> int:
     result: int = mod_result - 1
     return result
 
+
 def _gap_decode(gaps: list[int], dec: list[int]) -> str:
     num: int = 0
     if len(gaps) != len(dec):
@@ -63,40 +75,6 @@ def _gap_decode(gaps: list[int], dec: list[int]) -> str:
         num += gaps[idx] * dec[idx]
     return chr(num % 256)
 
-def _test_nibble():
-    result = _nibble("hello", 2)
-    testing.assertEqual(result.0, "he")
-    testing.assertEqual(result.1, "llo")
-
-    # Test exact length
-    result2 = _nibble("ab", 2)
-    testing.assertEqual(result2.0, "ab")
-    testing.assertEqual(result2.1, "")
-
-def junos_decrypt(crypt: str) -> str:
-    extra = get_extra()
-    chars: str = crypt[3:]  # Skip "$9$"
-    nibble_result = _nibble(chars, 1)
-    first_char: str = nibble_result.0
-    chars = nibble_result.1
-    nibble_result2 = _nibble(chars, extra[first_char])
-    chars = nibble_result2.1
-    prev: str = first_char
-    decrypt: str = ""
-
-    while len(chars) > 0:
-        decode: list[int] = ENCODING[len(decrypt) % len(ENCODING)]
-        nibble_result3 = _nibble(chars, len(decode))
-        nibble: str = nibble_result3.0
-        chars = nibble_result3.1
-        gaps: list[int] = []
-        for i in nibble:
-            g: int = _gap(prev, i)
-            prev = i
-            gaps.append(g)
-        decrypt += _gap_decode(gaps, decode)
-
-    return decrypt
 
 def _reverse(my_list: list[int]) -> list[int]:
     new_list: list[int] = []
@@ -106,9 +84,10 @@ def _reverse(my_list: list[int]) -> list[int]:
         idx -= 1
     return new_list
 
+
 def _gap_encode(pc: str, prev: str, encode: list[int]) -> str:
-    alpha_num = get_alpha_num()
-    num_alpha = get_num_alpha()
+    alpha_num = _get_alpha_num()
+    num_alpha = _get_num_alpha()
     _ord: int = ord(pc)
 
     crypt: str = ""
@@ -126,38 +105,75 @@ def _gap_encode(pc: str, prev: str, encode: list[int]) -> str:
 
     return crypt
 
+
 def _randc(cnt: int) -> str:
-    num_alpha = get_num_alpha()
+    num_alpha = _get_num_alpha()
     ret: str = ""
     for _ in range(cnt):
-        ret += num_alpha[len(num_alpha) - 1]
+        ret += num_alpha[random.randint(0, len(num_alpha))]
     return ret
 
-def junos_encrypt_with_salt(plaintext: str, salt: str) -> str:
-    extra = get_extra()
 
-    rand: str = _randc(extra[salt])
+def junos_encrypt(plaintext: str, salt: ?str = None) -> str:
+    extra = _get_extra()
+    actual_salt = salt if salt is not None else _randc(1)
+
+    rand: str = _randc(extra[actual_salt])
 
     pos: int = 0
-    prev: str = salt
-    crypt: str = MAGIC + salt + rand
+    prev: str = actual_salt
+    crypt: str = _MAGIC + actual_salt + rand
 
     for x in plaintext:
-        encode: list[int] = ENCODING[pos % len(ENCODING)]
+        encode: list[int] = _ENCODING[pos % len(_ENCODING)]
         crypt += _gap_encode(x, prev, encode)
         prev = crypt[len(crypt) - 1]
         pos += 1
 
     return crypt
 
-def junos_encrypt(plaintext: str, salt: ?str) -> str:
-    actual_salt = salt if salt is not None else _randc(1)
-    return junos_encrypt_with_salt(plaintext, actual_salt)
+
+def junos_decrypt(crypt: str) -> str:
+    extra = _get_extra()
+    chars: str = crypt[3:]  # Skip "$9$"
+    nibble_result = _nibble(chars, 1)
+    first_char: str = nibble_result.0
+    chars = nibble_result.1
+    nibble_result2 = _nibble(chars, extra[first_char])
+    chars = nibble_result2.1
+    prev: str = first_char
+    decrypt: str = ""
+
+    while len(chars) > 0:
+        decode: list[int] = _ENCODING[len(decrypt) % len(_ENCODING)]
+        nibble_result3 = _nibble(chars, len(decode))
+        nibble: str = nibble_result3.0
+        chars = nibble_result3.1
+        gaps: list[int] = []
+        for i in nibble:
+            g: int = _gap(prev, i)
+            prev = i
+            gaps.append(g)
+        decrypt += _gap_decode(gaps, decode)
+
+    return decrypt
+
+
+def _test_nibble():
+    result = _nibble("hello", 2)
+    testing.assertEqual(result.0, "he")
+    testing.assertEqual(result.1, "llo")
+
+    # Test exact length
+    result2 = _nibble("ab", 2)
+    testing.assertEqual(result2.0, "ab")
+    testing.assertEqual(result2.1, "")
+
 
 def _test_gap():
-    alpha_num = get_alpha_num()
     gap_val = _gap("Q", "z")
     testing.assertEqual(gap_val, 0)
+
 
 def _test_endecode():
     test_pairs: list[(str, str)] = [
