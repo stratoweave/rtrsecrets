@@ -118,7 +118,11 @@ def junos_encrypt(plaintext: str, salt: ?str = None) -> str:
     extra = _get_extra()
     actual_salt = salt if salt is not None else _randc(1)
 
-    rand: str = _randc(extra[actual_salt])
+    # Fixed pad char (instead of random) so output is deterministic. The pad
+    # is discarded on decrypt (junos_decrypt nibbles it off without feeding it
+    # into the cipher chain), so its value is cosmetic — "T" is verified to
+    # decode correctly on Juniper cRPD.
+    rand: str = "T" * extra[actual_salt]
 
     pos: int = 0
     prev: str = actual_salt
