@@ -2,8 +2,8 @@ name = "rtrsecrets"
 fingerprint = 0x04529d8d2b029f28
 dependencies = {    "actxcrypt": (
         repo_url="https://github.com/stratoweave/actxcrypt",
-        url="https://github.com/stratoweave/actxcrypt/archive/2922c69acc65e04d5cabb88556f48df8d8ead3b8.zip",
-        hash="N-V-__8AADdAAAAC3lhrF1ecyI0YSjyuMqeQUaZa6PFM_e13"
+        url="https://github.com/stratoweave/actxcrypt/archive/41d4897855daae42d5ebfa665735b392bfcb91ea.zip",
+        hash="N-V-__8AANOWAADim1JjhkAVxtXC-E_hHUlgsJWtqA2NP9hJ"
     )
 }
 zig_dependencies = {}

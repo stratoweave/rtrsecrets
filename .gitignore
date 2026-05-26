@@ -1,0 +1,7 @@
+.acton.lock
+.zig-cache
+build.zig
+build.zig.zon
+out/
+zig-out/
+zig-pkg/
