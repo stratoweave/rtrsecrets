@@ -1,6 +1,6 @@
 name = "rtrsecrets"
 fingerprint = 0x04529d8d2b029f28
-dependencies = {    "actxcrypt": (
+dependencies = {    "xcrypt": (
         repo_url="https://github.com/stratoweave/actxcrypt",
         url="https://github.com/stratoweave/actxcrypt/archive/abf7904bc8b4a5491b9ac6e39ea1de2efd47b0c1.zip",
         hash="N-V-__8AAL2WAACX-dJmzWQwDwCetcAFP3icHoWwBN7NGifq"
