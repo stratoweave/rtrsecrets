@@ -5,3 +5,4 @@ build.zig.zon
 out/
 zig-out/
 zig-pkg/
+nokia_srl_aes1_verification.md

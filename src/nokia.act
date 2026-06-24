@@ -1,0 +1,398 @@
+"""Nokia router secrets.
+
+SR Linux `$aes1$` reversible secret encryption, used for secrets that the
+device must be able to recover in cleartext (RADIUS / TACACS+ shared
+secrets, etc.).  This is obfuscation, not real protection: the AES key is a
+fixed 16-byte string compiled into SR Linux, so any `$aes1$` value can be
+decrypted offline.
+
+Format: `$aes1$<base64(salt-blob)>$<base64(ciphertext)>`
+
+  * salt-blob is 11 bytes: `0x01` + one don't-care byte + 8 salt bytes S +
+    `0x6f`.  Only S (bytes [2:10]) affects the ciphertext; the device picks
+    the don't-care byte and S at random, the `0x01`/`0x6f` framing is fixed.
+  * cipher is AES-128-CBC with a 16-byte IV `(S xor _IV_XOR) || 8 zero
+    bytes`, i.e. the low 8 IV bytes carry the per-secret salt and the high 8
+    are zero.
+  * padding is zero-padding to the next 16-byte multiple (NOT PKCS#7); an
+    input already a multiple of 16 gets no extra block.  Trailing NULs are
+    stripped on decrypt, so this round-trips for text secrets.
+
+Since the AES primitive is not available from the crypt/scrypt dependency,
+AES-128 is implemented here (FIPS-197) on top of the standard base64 module.
+"""
+import testing
+import random
+import base64
+
+_MAGIC = "$aes1$"
+
+# Static AES-128 key baked into SR Linux, and the constant the 8 salt bytes
+# are XORed with to form the low half of the CBC IV.
+_KEY = [0x50, 0x1d, 0x17, 0xd7, 0xed, 0x3d, 0xf7, 0x24, 0xd8, 0x0e, 0x04, 0xb6, 0x6b, 0xa4, 0xda, 0xcc]
+_IV_XOR = [0x5d, 0xfc, 0x2e, 0x5c, 0xc2, 0x01, 0x70, 0x70]
+
+# AES S-box and its inverse (FIPS-197).  `_test_sbox_pair` checks they are a
+# matching pair, catching any transcription error at test time.
+_SBOX = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+]
+
+_INV_SBOX = [
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+]
+
+
+def _to_ints(b: bytes) -> list[int]:
+    out: list[int] = []
+    for i in range(len(b)):
+        out.append(int(b[i]))
+    return out
+
+
+def _xtime(a: int) -> int:
+    hi = a & 0x80
+    b = (a << 1) & 0xff
+    if hi != 0:
+        b = b ^ 0x1b
+    return b
+
+
+def _gmul(a: int, b: int) -> int:
+    """Multiply two bytes in GF(2^8) with the AES reduction polynomial."""
+    p = 0
+    aa = a
+    bb = b
+    for _ in range(8):
+        lsb = bb & 1
+        if lsb != 0:
+            p = p ^ aa
+        hi = aa & 0x80
+        aa = (aa << 1) & 0xff
+        if hi != 0:
+            aa = aa ^ 0x1b
+        bb = bb >> 1
+    return p
+
+
+def _expand_key(key: list[int]) -> list[int]:
+    """AES-128 key schedule: 16-byte key -> 176 bytes (11 round keys)."""
+    w: list[int] = []
+    for i in range(16):
+        w.append(key[i])
+    rcon = 1
+    i = 16
+    while i < 176:
+        t0 = w[i - 4]
+        t1 = w[i - 3]
+        t2 = w[i - 2]
+        t3 = w[i - 1]
+        if (i // 4) % 4 == 0:
+            # RotWord then SubWord then XOR Rcon.
+            u0 = t1
+            u1 = t2
+            u2 = t3
+            u3 = t0
+            t0 = _SBOX[u0] ^ rcon
+            t1 = _SBOX[u1]
+            t2 = _SBOX[u2]
+            t3 = _SBOX[u3]
+            rcon = _xtime(rcon)
+        w.append(w[i - 16] ^ t0)
+        w.append(w[i - 15] ^ t1)
+        w.append(w[i - 14] ^ t2)
+        w.append(w[i - 13] ^ t3)
+        i = i + 4
+    return w
+
+
+def _add_round_key(s: list[int], ek: list[int], rnd: int) -> None:
+    base = 16 * rnd
+    for j in range(16):
+        s[j] = s[j] ^ ek[base + j]
+
+
+def _sub_bytes(s: list[int]) -> None:
+    for j in range(16):
+        s[j] = _SBOX[s[j]]
+
+
+def _inv_sub_bytes(s: list[int]) -> None:
+    for j in range(16):
+        s[j] = _INV_SBOX[s[j]]
+
+
+def _shift_rows(s: list[int]) -> None:
+    # State is column-major: index = row + 4*col.  Row r rotates left by r.
+    n = [0] * 16
+    for r in range(4):
+        for c in range(4):
+            n[r + 4 * c] = s[r + 4 * ((c + r) % 4)]
+    for j in range(16):
+        s[j] = n[j]
+
+
+def _inv_shift_rows(s: list[int]) -> None:
+    n = [0] * 16
+    for r in range(4):
+        for c in range(4):
+            n[r + 4 * c] = s[r + 4 * ((c + 4 - r) % 4)]
+    for j in range(16):
+        s[j] = n[j]
+
+
+def _mix_columns(s: list[int]) -> None:
+    for c in range(4):
+        base = 4 * c
+        s0 = s[base]
+        s1 = s[base + 1]
+        s2 = s[base + 2]
+        s3 = s[base + 3]
+        s[base] = _gmul(s0, 2) ^ _gmul(s1, 3) ^ s2 ^ s3
+        s[base + 1] = s0 ^ _gmul(s1, 2) ^ _gmul(s2, 3) ^ s3
+        s[base + 2] = s0 ^ s1 ^ _gmul(s2, 2) ^ _gmul(s3, 3)
+        s[base + 3] = _gmul(s0, 3) ^ s1 ^ s2 ^ _gmul(s3, 2)
+
+
+def _inv_mix_columns(s: list[int]) -> None:
+    for c in range(4):
+        base = 4 * c
+        s0 = s[base]
+        s1 = s[base + 1]
+        s2 = s[base + 2]
+        s3 = s[base + 3]
+        s[base] = _gmul(s0, 14) ^ _gmul(s1, 11) ^ _gmul(s2, 13) ^ _gmul(s3, 9)
+        s[base + 1] = _gmul(s0, 9) ^ _gmul(s1, 14) ^ _gmul(s2, 11) ^ _gmul(s3, 13)
+        s[base + 2] = _gmul(s0, 13) ^ _gmul(s1, 9) ^ _gmul(s2, 14) ^ _gmul(s3, 11)
+        s[base + 3] = _gmul(s0, 11) ^ _gmul(s1, 13) ^ _gmul(s2, 9) ^ _gmul(s3, 14)
+
+
+def _encrypt_block(block: list[int], ek: list[int]) -> list[int]:
+    s: list[int] = []
+    for i in range(16):
+        s.append(block[i])
+    _add_round_key(s, ek, 0)
+    for rnd in range(1, 10):
+        _sub_bytes(s)
+        _shift_rows(s)
+        _mix_columns(s)
+        _add_round_key(s, ek, rnd)
+    _sub_bytes(s)
+    _shift_rows(s)
+    _add_round_key(s, ek, 10)
+    return s
+
+
+def _decrypt_block(block: list[int], ek: list[int]) -> list[int]:
+    s: list[int] = []
+    for i in range(16):
+        s.append(block[i])
+    _add_round_key(s, ek, 10)
+    for k in range(9):
+        rnd = 9 - k
+        _inv_shift_rows(s)
+        _inv_sub_bytes(s)
+        _add_round_key(s, ek, rnd)
+        _inv_mix_columns(s)
+    _inv_shift_rows(s)
+    _inv_sub_bytes(s)
+    _add_round_key(s, ek, 0)
+    return s
+
+
+def _cbc_encrypt(data: list[int], ek: list[int], iv: list[int]) -> list[int]:
+    out: list[int] = []
+    prev: list[int] = []
+    for i in range(16):
+        prev.append(iv[i])
+    nblocks = len(data) // 16
+    for b in range(nblocks):
+        block: list[int] = []
+        for i in range(16):
+            block.append(data[16 * b + i] ^ prev[i])
+        enc = _encrypt_block(block, ek)
+        for i in range(16):
+            out.append(enc[i])
+        prev = enc
+    return out
+
+
+def _cbc_decrypt(data: list[int], ek: list[int], iv: list[int]) -> list[int]:
+    out: list[int] = []
+    prev: list[int] = []
+    for i in range(16):
+        prev.append(iv[i])
+    nblocks = len(data) // 16
+    for b in range(nblocks):
+        cblock: list[int] = []
+        for i in range(16):
+            cblock.append(data[16 * b + i])
+        dec = _decrypt_block(cblock, ek)
+        for i in range(16):
+            out.append(dec[i] ^ prev[i])
+        prev = cblock
+    return out
+
+
+def _zero_pad(data: list[int]) -> list[int]:
+    r = len(data) % 16
+    if r == 0:
+        return data
+    out: list[int] = []
+    for x in data:
+        out.append(x)
+    for _ in range(16 - r):
+        out.append(0)
+    return out
+
+
+def _derive_iv(blob: list[int]) -> list[int]:
+    """IV = (salt bytes blob[2:10] xor _IV_XOR) followed by 8 zero bytes."""
+    iv: list[int] = []
+    for i in range(8):
+        iv.append(blob[2 + i] ^ _IV_XOR[i])
+    for _ in range(8):
+        iv.append(0)
+    return iv
+
+
+def nokia_srl_aes1_encrypt(plaintext: str, salt: ?bytes = None) -> str:
+    """Encrypt a cleartext secret into SR Linux `$aes1$` form.
+
+    salt, if given, is the full 11-byte salt blob (e.g. from an existing
+    secret); only bytes [2:10] affect the ciphertext.  If omitted, a random
+    salt is generated with the device's `0x01 ... 0x6f` framing.
+    """
+    blob: list[int] = []
+    if salt is not None:
+        if len(salt) != 11:
+            raise ValueError("Nokia $aes1$ salt blob must be exactly 11 bytes")
+        blob = _to_ints(salt)
+    else:
+        blob.append(0x01)
+        blob.append(random.randint(0, 256))
+        for i in range(8):
+            blob.append(random.randint(0, 256) ^ _IV_XOR[i])
+        blob.append(0x6f)
+    iv = _derive_iv(blob)
+    ek = _expand_key(_KEY)
+    data = _zero_pad(_to_ints(plaintext.encode()))
+    ct = _cbc_encrypt(data, ek, iv)
+    salt_b64 = base64.encode(bytes(blob)).decode()
+    ct_b64 = base64.encode(bytes(ct)).decode()
+    return _MAGIC + salt_b64 + "$" + ct_b64
+
+
+def nokia_srl_aes1_decrypt(secret: str) -> str:
+    """Recover the cleartext from an SR Linux `$aes1$` secret."""
+    if not secret.startswith(_MAGIC):
+        raise ValueError("not an $aes1$ secret")
+    parts = secret.split("$")
+    if len(parts) != 4 or parts[1] != "aes1":
+        raise ValueError("malformed $aes1$ secret")
+    blob = _to_ints(base64.decode(parts[2].encode()))
+    if len(blob) != 11:
+        raise ValueError("malformed $aes1$ salt")
+    ct = _to_ints(base64.decode(parts[3].encode()))
+    if len(ct) % 16 != 0:
+        raise ValueError("$aes1$ ciphertext length must be a multiple of 16")
+    iv = _derive_iv(blob)
+    ek = _expand_key(_KEY)
+    pt = _cbc_decrypt(ct, ek, iv)
+    return bytes(pt).rstrip(b"\x00").decode()
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+def _test_sbox_pair():
+    for i in range(256):
+        testing.assertEqual(_INV_SBOX[_SBOX[i]], i)
+        testing.assertEqual(_SBOX[_INV_SBOX[i]], i)
+
+
+def _test_aes128_block_fips197():
+    # FIPS-197 Appendix B / C.1 known-answer for the raw AES-128 block.
+    ek = _expand_key(_to_ints(bytes.from_hex("000102030405060708090a0b0c0d0e0f")))
+    ct = _encrypt_block(_to_ints(bytes.from_hex("00112233445566778899aabbccddeeff")), ek)
+    testing.assertEqual(bytes(ct), bytes.from_hex("69c4e0d86a7b0430d8cdb78070b4c55a"))
+    back = _decrypt_block(ct, ek)
+    testing.assertEqual(bytes(back), bytes.from_hex("00112233445566778899aabbccddeeff"))
+
+
+def _test_cbc_two_block_vector():
+    # Two-block AES-128-CBC vector (Nokia key, oracle-style IV) generated with
+    # `openssl enc -aes-128-cbc -nopad`, to pin down CBC chaining against spec.
+    ek = _expand_key(_KEY)
+    iv = _to_ints(bytes.from_hex("bb7ee42a0e569a9b0000000000000000"))
+    pt = _to_ints("Long secret over one block......".encode())
+    ct = _cbc_encrypt(pt, ek, iv)
+    testing.assertEqual(bytes(ct), bytes.from_hex("7b728c20faddbd5f208b71f884b3f6b7b409380ae0194180d501ff4de50f975c"))
+    back = _cbc_decrypt(ct, ek, iv)
+    testing.assertEqual(bytes(back), "Long secret over one block......".encode())
+
+
+def _test_srl_known_vector():
+    # Captured from a real SR Linux 25.3.2 device.
+    expected = "$aes1$ATfmgsp2zFfq628=$I1nLInyu0rceM0Sb1rv5Tw=="
+    salt = base64.decode(b"ATfmgsp2zFfq628=")
+    testing.assertEqual(nokia_srl_aes1_encrypt("acme-65501", salt), expected)
+    testing.assertEqual(nokia_srl_aes1_decrypt(expected), "acme-65501")
+
+
+def _test_srl_roundtrip_fixed_salt():
+    salt = base64.decode(b"ATfmgsp2zFfq628=")
+    cases = ["x", "acme-65501", "sixteen-byte-key", "a much longer shared secret spanning several blocks!"]
+    for p in cases:
+        enc = nokia_srl_aes1_encrypt(p, salt)
+        testing.assertTrue(enc.startswith(_MAGIC))
+        testing.assertEqual(nokia_srl_aes1_decrypt(enc), p)
+
+
+def _test_srl_random_salt_roundtrip():
+    enc = nokia_srl_aes1_encrypt("hunter2")
+    parts = enc.split("$")
+    blob = _to_ints(base64.decode(parts[2].encode()))
+    testing.assertEqual(len(blob), 11)
+    testing.assertEqual(blob[0], 0x01)
+    testing.assertEqual(blob[10], 0x6f)
+    testing.assertEqual(nokia_srl_aes1_decrypt(enc), "hunter2")
+
+
+def _test_srl_decrypt_rejects_garbage():
+    try:
+        _ignored = nokia_srl_aes1_decrypt("$9$notanaes1secret")
+        testing.error("garbage")
+    except ValueError:
+        pass
